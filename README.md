@@ -1,4 +1,6 @@
+💿
 # Audio Tagger
+<img width="1032" height="832" alt="Screenshot 2026-06-13 at 23 14 22" src="https://github.com/user-attachments/assets/74a1a038-2a48-44fa-9286-c552df7934ba" />
 
 A macOS desktop app for music library management with a Liquid Glass-inspired UI.
 
@@ -17,6 +19,7 @@ Built with Python + PyWebView. No subscription required — uses free APIs.
 - Live file table with per-file status, RG, DR, Lyrics, Year, Genre columns
 
 ### FLAC Checker
+<img width="1032" height="832" alt="Screenshot 2026-06-13 at 23 14 29" src="https://github.com/user-attachments/assets/1b98c6d0-8151-44c3-8ac2-25e90856743d" />
 - **Source authenticity** — runs [FLAD](https://github.com/Sg4Dylan/FLAD) model to detect fake lossless (MP3/AAC/Opus upscales)
 - **Hi-Res analysis** — FFT spectrum check: True Hi-Res / CD upscale / Likely lossy upscale
 - **DR14** per file
