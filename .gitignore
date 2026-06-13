@@ -1,0 +1,11 @@
+.DS_Store
+build/
+dist/
+__pycache__/
+*.spec
+*.pyc
+icon.iconset/
+icon.icns
+rw.*.dmg
+config.txt
+config.txt
