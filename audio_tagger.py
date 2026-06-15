@@ -352,7 +352,7 @@ def calculate_dr14(filepath):
 # FLAC CHECKER LOGIC
 # ============================================================
 
-FLAD_DIR = '/Users/nikitagrisacev/FLAD'
+FLAD_DIR = load_config().get('FLAD_DIR', '')  # Set in config.txt if you have FLAD installed
 
 def run_flac_check(filepath, log_lines: list) -> dict:
     """Запускает FLAD + Hi-Res check на одном файле. Возвращает dict с результатами."""
@@ -862,9 +862,9 @@ body.light .settings-note a{color:#0066cc}
     <!-- FLAC CHECKER -->
     <div class="panel" id="panel-checker">
       <div class="field-row" style="margin-bottom:12px">
-        <input class="glass-input" id="checker-path" placeholder="/path/to/music">
+        <input class="glass-input" id="checker-path" placeholder="/path/to/music" oninput="document.getElementById('scanBtn').disabled=!this.value.trim()">
         <button class="glass-btn" onclick="browseFolder('checker-path')">Browse</button>
-        <button class="btn-run" style="flex:none;padding:7px 22px;font-size:13px;border-radius:10px" onclick="runChecker()" id="scanBtn">Scan</button>
+        <button class="btn-run" style="flex:none;padding:7px 22px;font-size:13px;border-radius:10px" onclick="runChecker()" id="scanBtn" disabled>Scan</button>
         <button class="glass-btn" onclick="openCheckerLog()">Log</button>
       </div>
 
@@ -900,6 +900,10 @@ body.light .settings-note a{color:#0066cc}
       <div class="field-row">
         <span class="field-lbl">Log path</span>
         <input class="glass-input" id="log-path" placeholder="Empty = saves to music folder">
+      </div>
+      <div class="field-row">
+        <span class="field-lbl">FLAD path</span>
+        <input class="glass-input" id="flad-dir" placeholder="/path/to/FLAD (optional)">
       </div>
       <div class="sep"></div>
       <button class="save-btn" onclick="saveSettings()">Save</button>
@@ -954,8 +958,14 @@ function browseFolder(inputId){
     if(path){
       document.getElementById(inputId).value=path;
       if(inputId==='music-path'){
-        document.getElementById('checker-path').value=path;
+        // Sync to checker only if checker path is empty
+        const checkerPath=document.getElementById('checker-path');
+        if(!checkerPath.value.trim()) checkerPath.value=path;
         loadFileList();
+      }
+      if(inputId==='checker-path'){
+        // Enable Scan button when checker path is set
+        document.getElementById('scanBtn').disabled=!path.trim();
       }
     }
   });
@@ -1173,6 +1183,7 @@ function saveSettings(){
     genius_token:document.getElementById('genius-token').value.trim(),
     lastfm_key:document.getElementById('lastfm-key').value.trim(),
     log_path:document.getElementById('log-path').value.trim(),
+    flad_dir:document.getElementById('flad-dir').value.trim(),
   }).then(()=>{appendLog('✓ Settings saved','ok');setStatus('Settings saved')});
 }
 
@@ -1181,10 +1192,15 @@ function loadSettings(cfg){
     document.getElementById('genius-token').value=cfg.GENIUS_TOKEN;
   if(cfg.LASTFM_KEY&&cfg.LASTFM_KEY!=='YOUR_LASTFM_API_KEY')
     document.getElementById('lastfm-key').value=cfg.LASTFM_KEY;
-  if(cfg.LOG_PATH) document.getElementById('log-path').value=cfg.LOG_PATH;
+  if(cfg.LOG_PATH)  document.getElementById('log-path').value=cfg.LOG_PATH;
+  if(cfg.FLAD_DIR)  document.getElementById('flad-dir').value=cfg.FLAD_DIR;
   if(cfg.MUSIC_ROOT){
     document.getElementById('music-path').value=cfg.MUSIC_ROOT;
-    document.getElementById('checker-path').value=cfg.MUSIC_ROOT;
+    // Sync to checker only if it's empty
+    const cp=document.getElementById('checker-path');
+    if(!cp.value.trim()) cp.value=cfg.MUSIC_ROOT;
+    // Enable Scan button if path is set
+    document.getElementById('scanBtn').disabled=!cfg.MUSIC_ROOT.trim();
   }
 }
 
@@ -1263,7 +1279,8 @@ class Api:
         cfg = load_config()
         if data.get('genius_token'): cfg['GENIUS_TOKEN'] = data['genius_token']
         if data.get('lastfm_key'):   cfg['LASTFM_KEY']   = data['lastfm_key']
-        cfg['LOG_PATH'] = data.get('log_path', '')
+        cfg['LOG_PATH']  = data.get('log_path', '')
+        cfg['FLAD_DIR']  = data.get('flad_dir', '')
         save_config(cfg)
 
     def stop_tagger(self):
