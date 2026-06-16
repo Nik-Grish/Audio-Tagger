@@ -29,12 +29,52 @@ import soundfile as sf
 ctk.set_appearance_mode("system")
 ctk.set_default_color_theme("blue")
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.txt")
+# App version — read from version.txt bundled with the app
+def get_app_version() -> str:
+    """Read version from version.txt — checks multiple locations."""
+    candidates = []
+    # 1. PyInstaller bundle
+    if getattr(sys, 'frozen', False):
+        candidates.append(os.path.join(sys._MEIPASS, 'version.txt'))
+    # 2. Next to the script file
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'version.txt'))
+    # 3. Current working directory
+    candidates.append(os.path.join(os.getcwd(), 'version.txt'))
+
+    for vpath in candidates:
+        try:
+            with open(vpath) as f:
+                v = f.read().strip()
+                if v: return v
+        except Exception:
+            continue
+    return 'v1.0'
+
+APP_VERSION = get_app_version()
+
+# Store config in ~/Library/Application Support/AudioTagger/
+# This works both when running as .app and from source
+_APP_SUPPORT = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'AudioTagger')
+os.makedirs(_APP_SUPPORT, exist_ok=True)
+CONFIG_PATH = os.path.join(_APP_SUPPORT, 'config.txt')
 SUPPORTED_EXTS = {"mp3", "flac", "m4a", "ogg", "wav", "aiff"}
 LASTFM_BASE = 'https://ws.audioscrobbler.com/2.0/'
+# Tags that are NOT genres — skip unconditionally
+# These are moods, activities, nationalities, or personal tags
 _NON_GENRE_TAGS = {
-    'seen live', 'favorite', 'love', 'awesome', 'cool', 'great', 'beautiful',
-    'amazing', 'best', 'favourite', 'owned', 'albums i own',
+    # Personal/activity tags
+    'seen live', 'favorite', 'favourite', 'love', 'owned', 'albums i own',
+    # Meaningless quality tags
+    'awesome', 'cool', 'great', 'beautiful', 'amazing', 'best',
+    # Listener count tags
+    'under 2000 listeners', 'under 500 listeners',
+    # Nationality/language tags (not genres)
+    'canadian', 'american', 'british', 'australian', 'swedish', 'norwegian',
+    'finnish', 'german', 'french', 'japanese', 'danish', 'dutch',
+    'english', 'irish', 'scottish',
+    # Miscellaneous non-genre
+    'all', 'male vocalist', 'female vocalist', 'instrumental',
+    'straight edge', 'christian', 'atheist',
 }
 
 # ============================================================
@@ -280,13 +320,20 @@ def fix_year(s: str) -> str:
     m = re.search(r'\b(\d{4})\b', normalized)
     return m.group(1) if m else s
 
-def _pick_genre(tags: list):
+def _pick_genre(tags: list) -> str | None:
+    """
+    Pick best genre tag from Last.fm tags list.
+
+    Strategy: Last.fm already sorts tags by count (most votes first).
+    We just skip non-genre tags and return the first real genre.
+    The most-voted tag is the most representative genre.
+    """
     for tag in tags:
         name = tag.get('name', '').strip()
         count = int(tag.get('count', 0))
         if count < 5: continue
+        if not name or len(name) < 2 or len(name) > 60: continue
         if name.lower() in _NON_GENRE_TAGS: continue
-        if len(name) < 2 or len(name) > 40: continue
         return name.title()
     return None
 
@@ -319,7 +366,7 @@ def load_audio_for_dr(filepath):
                 return f.read(dtype='float32'), f.samplerate
         except Exception:
             pass
-    cmd = ['/opt/homebrew/bin/ffmpeg', '-i', filepath, '-f', 'f32le', '-ac', '2',
+    cmd = [get_ffmpeg_path(), '-i', filepath, '-f', 'f32le', '-ac', '2',
            '-ar', '44100', 'pipe:1', '-loglevel', 'quiet']
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0 or not result.stdout: return None, None
@@ -352,7 +399,41 @@ def calculate_dr14(filepath):
 # FLAC CHECKER LOGIC
 # ============================================================
 
-FLAD_DIR = load_config().get('FLAD_DIR', '')  # Set in config.txt if you have FLAD installed
+def get_flad_dir() -> str:
+    """Returns FLAD directory: bundled inside .app > config.txt > ~/FLAD fallback."""
+    # 1. Bundled inside PyInstaller .app
+    if getattr(sys, 'frozen', False):
+        bundled = os.path.join(sys._MEIPASS, 'flad_bundle')
+        if os.path.exists(os.path.join(bundled, 'models', 'flad.onnx')):
+            return bundled
+    # 2. From config.txt
+    cfg_dir = load_config().get('FLAD_DIR', '')
+    if cfg_dir and os.path.exists(os.path.join(cfg_dir, 'models', 'flad.onnx')):
+        return cfg_dir
+    # 3. Default ~/FLAD
+    default = os.path.join(os.path.expanduser('~'), 'FLAD')
+    if os.path.exists(os.path.join(default, 'models', 'flad.onnx')):
+        return default
+    return ''
+
+FLAD_DIR = get_flad_dir()
+
+def get_bundled_path(name: str) -> str:
+    """Returns path to bundled binary (PyInstaller) or system fallback."""
+    if getattr(sys, 'frozen', False):
+        # Running inside .app bundle
+        bundle_dir = sys._MEIPASS
+        bundled = os.path.join(bundle_dir, 'bin', name)
+        if os.path.exists(bundled):
+            return bundled
+    # Fallback to Homebrew
+    return f'/opt/homebrew/bin/{name}'
+
+def get_rsgain_path() -> str:
+    return get_bundled_path('rsgain')
+
+def get_ffmpeg_path() -> str:
+    return get_bundled_path('ffmpeg')
 
 def run_flac_check(filepath, log_lines: list) -> dict:
     """Запускает FLAD + Hi-Res check на одном файле. Возвращает dict с результатами."""
@@ -392,24 +473,61 @@ def run_flac_check(filepath, log_lines: list) -> dict:
     pred_format = 'FLAC'
     lossy_ratio = 0.0
 
+    FLAD_DIR = get_flad_dir()
     if FLAD_DIR and os.path.exists(FLAD_DIR):
         try:
             orig_cwd = os.getcwd()
             orig_path = _sys.path[:]
+
+            # Set CWD to FLAD_DIR so relative paths in FLAD code work
             os.chdir(FLAD_DIR)
-            if FLAD_DIR not in _sys.path:
-                _sys.path.insert(0, FLAD_DIR)
-            from flad.eval import FLAD as FLADModel
+
+            # Add both FLAD_DIR and its parent to sys.path
+            for p in [FLAD_DIR, os.path.dirname(FLAD_DIR)]:
+                if p not in _sys.path:
+                    _sys.path.insert(0, p)
+
+            # Import FLAD — try package import first, then direct file
+            FLADModel = None
+            try:
+                # Standard package: FLAD_DIR/flad/eval.py
+                from flad.eval import FLAD as FLADModel
+                from flad import utils
+            except ImportError:
+                # Bundled flat layout: FLAD_DIR/eval.py + utils.py
+                import importlib.util as _ilu
+                for fname, modname in [('eval.py','_flad_eval'),('eval1.py','_flad_eval')]:
+                    fpath = os.path.join(FLAD_DIR, fname)
+                    if os.path.exists(fpath) and FLADModel is None:
+                        spec = _ilu.spec_from_file_location(modname, fpath)
+                        mod = _ilu.module_from_spec(spec)
+                        spec.loader.exec_module(mod)
+                        FLADModel = mod.FLAD
+                for fname, modname in [('utils.py','_flad_utils'),('utils1.py','_flad_utils')]:
+                    fpath = os.path.join(FLAD_DIR, 'flad', fname)
+                    if not os.path.exists(fpath):
+                        fpath = os.path.join(FLAD_DIR, fname)
+                    if os.path.exists(fpath):
+                        spec = _ilu.spec_from_file_location(modname, fpath)
+                        utils = _ilu.module_from_spec(spec)
+                        spec.loader.exec_module(utils)
+                        break
+
+            if FLADModel is None:
+                raise ImportError("Could not load FLAD model class")
+
             flad = FLADModel()
 
-            from flad import utils
             import numpy as _np
+
+            # Use temp dir inside FLAD_DIR to avoid CWD issues
+            temp_dir = os.path.join(FLAD_DIR, '_temp_spectra')
+            os.makedirs(temp_dir, exist_ok=True)
 
             r_map = ['FLAC', 'AAC', 'mp3', 'Opus']
             y_s = utils.get_side(filepath)
-            os.makedirs('temp', exist_ok=True)
-            utils.get_spectrum(y_s, 0, 'temp', max=20)
-            spectrum_list = utils.get_file_list('temp', ext='.jpg')
+            utils.get_spectrum(y_s, 0, temp_dir, max=20)
+            spectrum_list = utils.get_file_list(temp_dir, ext='.jpg')
 
             counter = _np.zeros(4)
             probs_list = []
@@ -444,6 +562,10 @@ def run_flac_check(filepath, log_lines: list) -> dict:
                 source_label = 'Lossless'
                 log_lines.append(f"[FLAD] Result: Lossless ({source_prob:.1f}%)")
 
+            # Clean up temp spectra
+            import shutil as _shutil
+            try: _shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception: pass
             os.chdir(orig_cwd)
             _sys.path = orig_path
         except Exception as e:
@@ -547,64 +669,47 @@ import webview
 # ============================================================
 
 
+
 HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Audio Tagger</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --glass-bg:rgba(255,255,255,0.08);
-  --glass-border:rgba(255,255,255,0.18);
-  --glass-input:rgba(255,255,255,0.07);
-  --text:rgba(255,255,255,0.92);
-  --text-muted:rgba(255,255,255,0.45);
-  --sep:rgba(255,255,255,0.1);
-  --log-bg:rgba(0,0,0,0.35);
-  --sidebar-w:176px;
-  --radius:14px;
+  --glass-bg:rgba(255,255,255,0.08);--glass-border:rgba(255,255,255,0.18);
+  --glass-input:rgba(255,255,255,0.07);--text:rgba(255,255,255,0.92);
+  --text-muted:rgba(255,255,255,0.45);--sep:rgba(255,255,255,0.1);
+  --sidebar-w:176px;--radius:14px;
   --font:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;
   --mono:'Menlo','SF Mono',monospace;
 }
 body.light{
-  --glass-bg:rgba(255,255,255,0.52);
-  --glass-border:rgba(255,255,255,0.85);
-  --glass-input:rgba(255,255,255,0.65);
-  --text:rgba(0,0,0,0.88);
-  --text-muted:rgba(0,0,0,0.45);
-  --sep:rgba(0,0,0,0.1);
-  --log-bg:rgba(0,0,0,0.05);
+  --glass-bg:rgba(255,255,255,0.52);--glass-border:rgba(255,255,255,0.85);
+  --glass-input:rgba(255,255,255,0.65);--text:rgba(0,0,0,0.88);
+  --text-muted:rgba(0,0,0,0.45);--sep:rgba(0,0,0,0.1);
 }
 html,body{height:100%;overflow:hidden}
 body{font-family:var(--font);background:#060614;color:var(--text);display:flex;flex-direction:column;height:100vh;transition:color .3s}
 body.light{background:#dce8fa}
 
-/* ORBS */
 .scene{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
-.orb{position:absolute;border-radius:50%;filter:blur(72px);opacity:.38;transition:opacity .5s}
-body.light .orb{opacity:.22}
+.orb{position:absolute;border-radius:50%;filter:blur(72px);opacity:.38}
+body.light .orb{opacity:.2}
 .o1{width:420px;height:420px;background:#3b82f6;top:-120px;left:-90px}
 .o2{width:360px;height:360px;background:#8b5cf6;top:40px;right:-70px}
 .o3{width:320px;height:320px;background:#06b6d4;bottom:-60px;left:32%}
 
-/* TITLEBAR */
-.titlebar{height:44px;display:flex;align-items:center;padding:0 14px;gap:8px;flex-shrink:0;position:relative;z-index:10;cursor:default}
-.dots{display:flex;gap:6px}
-.dot{width:12px;height:12px;border-radius:50%;cursor:pointer;transition:filter .15s}
-.dot:hover{filter:brightness(1.3)}
-.dot-r{background:#ff5f57}.dot-y{background:#ffbd2e}.dot-g{background:#28c840}
-.tb-icon{font-size:18px;margin-left:10px;opacity:.7}
-.drag-area{width:80px;height:44px;position:absolute;top:0;left:0;-webkit-app-region:drag;-webkit-user-select:none}
+.titlebar{height:44px;display:flex;align-items:center;padding:0 14px;gap:8px;flex-shrink:0;position:relative;z-index:10}
+.drag-area{position:absolute;top:0;left:0;width:120px;height:44px;-webkit-app-region:drag;-webkit-user-select:none}
+.tb-icon{font-size:18px;margin-left:86px;opacity:.7}
 .win-title{font-size:13px;font-weight:500;color:var(--text-muted);margin-left:4px}
-.theme-toggle{margin-left:auto;background:var(--glass-bg);border:1px solid var(--glass-border);border-radius:20px;padding:4px 12px;font-size:12px;color:var(--text-muted);cursor:pointer;display:flex;align-items:center;gap:5px;transition:all .2s;font-family:var(--font)}
+.theme-toggle{margin-left:auto;background:var(--glass-bg);border:1px solid var(--glass-border);border-radius:20px;padding:4px 12px;font-size:12px;color:var(--text-muted);cursor:pointer;font-family:var(--font);transition:all .2s}
 .theme-toggle:hover{color:var(--text);background:rgba(255,255,255,0.12)}
 
-/* LAYOUT */
 .layout{display:flex;flex:1;overflow:hidden;position:relative;z-index:2;padding:0 12px 12px;gap:10px}
 
-/* SIDEBAR */
 .sidebar{width:var(--sidebar-w);flex-shrink:0;background:var(--glass-bg);border:1px solid var(--glass-border);border-radius:var(--radius);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);padding:10px 7px;display:flex;flex-direction:column;gap:3px;position:relative;overflow:hidden}
 .sidebar::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,0.4),transparent)}
 .nav-item{display:flex;align-items:center;gap:9px;padding:8px 11px;border-radius:10px;font-size:13px;color:var(--text-muted);cursor:pointer;transition:all .15s;user-select:none}
@@ -617,13 +722,11 @@ body.light .orb{opacity:.22}
 .sidebar-link{display:block;font-size:10px;color:var(--text-muted);padding:3px 8px;text-decoration:none;opacity:.7;transition:opacity .15s}
 .sidebar-link:hover{opacity:1;color:var(--text)}
 
-/* CONTENT */
 .content{flex:1;overflow:hidden;display:flex;flex-direction:column}
 .panel{display:none;flex-direction:column;height:100%;background:var(--glass-bg);border:1px solid var(--glass-border);border-radius:var(--radius);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);padding:14px;overflow:hidden;position:relative}
 .panel::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,0.32),transparent)}
 .panel.active{display:flex}
 
-/* FIELDS */
 .field-row{display:flex;align-items:center;gap:7px;margin-bottom:9px}
 .field-lbl{font-size:12px;color:var(--text-muted);width:86px;flex-shrink:0}
 .glass-input{flex:1;background:var(--glass-input);border:1px solid var(--glass-border);border-radius:10px;padding:7px 10px;font-size:12px;color:var(--text);font-family:var(--mono);outline:none;transition:border .2s}
@@ -633,7 +736,6 @@ body.light .orb{opacity:.22}
 .glass-btn.icon-btn{padding:7px 10px;font-size:14px}
 .sep{height:1px;background:var(--sep);margin:9px 0}
 
-/* CHECKBOXES */
 .opts-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:10px}
 .opt{display:flex;align-items:center;gap:7px;cursor:pointer;user-select:none;position:relative}
 .glass-check{width:16px;height:16px;border-radius:5px;border:1px solid rgba(255,255,255,0.3);background:rgba(10,132,255,.55);display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all .15s;position:relative;overflow:hidden}
@@ -643,12 +745,10 @@ body.light .orb{opacity:.22}
 .opt-lbl{font-size:13px;color:var(--text)}
 .opt-lbl.dim{color:var(--text-muted)}
 
-/* TOOLTIP */
 .tip{display:none;position:absolute;left:0;top:calc(100% + 6px);z-index:100;background:rgba(20,20,40,0.96);border:1px solid rgba(255,255,255,0.15);border-radius:10px;padding:8px 11px;font-size:11px;line-height:1.5;color:rgba(255,255,255,0.85);white-space:normal;width:220px;pointer-events:none;backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);box-shadow:0 8px 32px rgba(0,0,0,0.4)}
-body.light .tip{background:rgba(240,245,255,0.97);color:rgba(0,0,0,0.8);border-color:rgba(0,0,0,0.12)}
+body.light .tip{background:rgba(240,245,255,0.97);color:rgba(0,0,0,0.8);border-color:rgba(0,0,0,.12)}
 .opt:hover .tip{display:block}
 
-/* BUTTONS */
 .btn-row{display:flex;gap:7px;margin-bottom:9px}
 .btn-run{flex:1;background:rgba(10,132,255,.55);border:1px solid rgba(10,132,255,.7);border-radius:12px;padding:8px;font-size:14px;font-weight:600;color:white;cursor:pointer;transition:all .15s;font-family:var(--font);position:relative;overflow:hidden}
 .btn-run::before{content:'';position:absolute;top:0;left:0;right:0;height:50%;background:linear-gradient(180deg,rgba(255,255,255,.18),transparent)}
@@ -657,11 +757,10 @@ body.light .tip{background:rgba(240,245,255,0.97);color:rgba(0,0,0,0.8);border-c
 .btn-stop::before{content:'';position:absolute;top:0;left:0;right:0;height:50%;background:linear-gradient(180deg,rgba(255,255,255,.15),transparent)}
 .btn-stop:hover{filter:brightness(1.15)}.btn-stop:disabled{opacity:.3;cursor:not-allowed}
 
-/* PROGRESS */
 .progress-wrap{height:3px;background:rgba(255,255,255,0.09);border-radius:2px;margin-bottom:8px;overflow:hidden;flex-shrink:0}
 .progress-fill{height:100%;width:0%;background:linear-gradient(90deg,#0a84ff,#30d158);border-radius:2px;transition:width .3s ease}
 
-/* TAGGER TABLE */
+/* Tagger table */
 .tbl-wrap{flex:1;overflow:auto;border-radius:10px;border:1px solid var(--sep);margin-bottom:0}
 .tbl-wrap::-webkit-scrollbar{width:6px}.tbl-wrap::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.15);border-radius:3px}
 table{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed}
@@ -674,32 +773,34 @@ tr:hover td{background:rgba(255,255,255,0.04)}
 body.light th{background:rgba(0,0,0,0.04)}
 body.light td{border-bottom-color:rgba(0,0,0,0.06)}
 body.light tr:hover td{background:rgba(0,0,0,0.03)}
+.finder-btn{background:none;border:none;cursor:pointer;font-size:13px;opacity:.5;padding:0 2px;transition:opacity .15s;-webkit-user-select:none;user-select:none}
+.finder-btn:hover{opacity:1}
+/* Column resizer */
+th{position:relative}
+.col-resizer{position:absolute;right:0;top:0;bottom:0;width:5px;cursor:col-resize;user-select:none;-webkit-user-select:none;z-index:2}
+.col-resizer:hover,.col-resizer.active{background:rgba(255,255,255,0.25)}
+#taggerTable{table-layout:fixed}
 
-/* STATUS BAR */
 .statusbar{flex-shrink:0;margin-top:7px;display:flex;align-items:center;gap:8px;min-height:22px}
 .status-text{font-size:11px;color:var(--text-muted);cursor:pointer;transition:color .15s;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .status-text:hover{color:var(--text);text-decoration:underline}
 .status-text.err{color:#ff6b6b}
 
-/* LOG POPUP */
+/* Log popup */
 .log-overlay{display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,0.5);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);align-items:center;justify-content:center}
 .log-overlay.open{display:flex}
 .log-popup{background:rgba(18,18,35,0.97);border:1px solid rgba(255,255,255,0.15);border-radius:16px;width:680px;max-height:70vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 24px 80px rgba(0,0,0,0.6)}
-body.light .log-popup{background:rgba(240,245,255,0.98);border-color:rgba(0,0,0,0.12)}
+body.light .log-popup{background:rgba(240,245,255,0.98);border-color:rgba(0,0,0,.12)}
 .log-popup-header{display:flex;align-items:center;padding:12px 16px;border-bottom:1px solid var(--sep)}
 .log-popup-title{font-size:13px;font-weight:500;flex:1}
 .log-popup-close{background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer;padding:0 4px;line-height:1}
 .log-popup-close:hover{color:var(--text)}
-.log-content{flex:1;overflow-y:auto;padding:12px 14px;font-family:var(--mono);font-size:11px;line-height:1.7}
+.log-content{flex:1;overflow-y:auto;padding:12px 14px;font-family:var(--mono);font-size:11px;line-height:1.7;user-select:text;-webkit-user-select:text}
 .log-content::-webkit-scrollbar{width:6px}.log-content::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.15);border-radius:3px}
 .log-ok{color:#30d158}.log-err{color:#ff453a}.log-info{color:#64d2ff}.log-dim{color:var(--text-muted)}
 .log-line{margin:0}
 
-/* CHECKER PANEL */
-.verdict-hires{color:#30d158}.verdict-cd{color:#64d2ff}.verdict-upscale{color:#ffd60a}
-.verdict-suspicious{color:#ff9f0a}.verdict-fake{color:#ff453a}.verdict-error{color:rgba(255,255,255,.3)}
-
-/* Badges — readable on both themes */
+/* Checker */
 .badge{display:inline-block;font-size:10px;font-weight:600;padding:2px 8px;border-radius:20px;position:relative;cursor:default}
 .b-ok{background:rgba(48,209,88,.15);border:1px solid rgba(48,209,88,.4);color:#30d158}
 .b-warn{background:rgba(255,214,10,.18);border:1px solid rgba(255,180,0,.55);color:#b8860b}
@@ -710,32 +811,35 @@ body.light .b-cd{background:rgba(0,80,180,.15);border-color:rgba(0,80,160,.5);co
 .b-susp{background:rgba(255,159,10,.15);border:1px solid rgba(255,159,10,.4);color:#cc7700}
 body.light .b-susp{background:rgba(180,100,0,.15);border-color:rgba(150,80,0,.4);color:#7a4400}
 
-/* Badge tooltip */
-.badge-tip{display:none;position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%);z-index:150;background:rgba(20,20,40,0.97);border:1px solid rgba(255,255,255,0.15);border-radius:10px;padding:9px 12px;font-size:11px;line-height:1.6;color:rgba(255,255,255,0.88);white-space:normal;width:260px;pointer-events:none;backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);box-shadow:0 8px 32px rgba(0,0,0,.5);font-weight:400}
-body.light .badge-tip{background:rgba(240,245,255,0.98);color:rgba(0,0,0,0.82);border-color:rgba(0,0,0,.12)}
 #floatTip{display:none;position:fixed;z-index:999;background:rgba(20,20,40,0.97);border:1px solid rgba(255,255,255,0.15);border-radius:10px;padding:9px 12px;font-size:11px;line-height:1.6;color:rgba(255,255,255,0.88);max-width:280px;pointer-events:none;backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);box-shadow:0 8px 32px rgba(0,0,0,.5)}
 body.light #floatTip{background:rgba(240,245,255,0.98);color:rgba(0,0,0,0.82);border-color:rgba(0,0,0,.12)}
-.opt:hover .tip{display:block}
 
 .checker-progress-wrap{height:3px;background:rgba(255,255,255,0.08);border-radius:2px;margin-top:8px;overflow:hidden;flex-shrink:0}
 .checker-progress-fill{height:100%;width:0%;background:linear-gradient(90deg,#0a84ff,#30d158);transition:width .3s ease}
 .summary{font-size:11px;color:var(--text-muted);padding:6px 0 0;flex-shrink:0}
 .summary b{color:var(--text);font-weight:500}
 
-/* SETTINGS */
-.settings-note{font-size:12px;color:var(--text-muted);line-height:1.6;background:var(--glass-input);border:1px solid var(--sep);border-radius:10px;padding:10px 12px;margin-top:10px}
-.settings-note a{color:#64d2ff}
-body.light .settings-note a{color:#0066cc}
+/* FLAD banner */
+.flad-banner{background:rgba(255,159,10,0.12);border:1px solid rgba(255,159,10,0.3);border-radius:10px;padding:10px 14px;margin-bottom:10px;display:flex;align-items:center;gap:10px;flex-shrink:0}
+.flad-banner.hidden{display:none}
+.flad-banner-text{flex:1;font-size:12px;color:rgba(255,159,10,0.9)}
+body.light .flad-banner-text{color:#7a4400}
+.flad-install-btn{background:rgba(255,159,10,0.3);border:1px solid rgba(255,159,10,0.5);border-radius:8px;padding:5px 12px;font-size:12px;font-weight:600;color:white;cursor:pointer;font-family:var(--font);white-space:nowrap}
+.flad-install-btn:hover{filter:brightness(1.2)}
+
+/* Settings */
 .save-btn{display:inline-block;background:rgba(10,132,255,.55);border:1px solid rgba(10,132,255,.7);border-radius:10px;padding:8px 20px;font-size:13px;font-weight:600;color:white;cursor:pointer;transition:all .15s;font-family:var(--font);position:relative;overflow:hidden}
 .save-btn::before{content:'';position:absolute;top:0;left:0;right:0;height:50%;background:linear-gradient(180deg,rgba(255,255,255,.18),transparent)}
 .save-btn:hover{filter:brightness(1.15)}
+.settings-note{font-size:12px;color:var(--text-muted);line-height:1.6;background:var(--glass-input);border:1px solid var(--sep);border-radius:10px;padding:10px 12px;margin-top:10px}
+.settings-note a{color:#64d2ff}
+body.light .settings-note a{color:#0066cc}
+.settings-scroll{flex:1;overflow-y:auto;padding-right:4px}
+.settings-scroll::-webkit-scrollbar{width:4px}.settings-scroll::-webkit-scrollbar-thumb{background:rgba(255,255,255,.15);border-radius:2px}
 </style>
 </head>
 <body id="body">
-
-<div class="scene">
-  <div class="orb o1"></div><div class="orb o2"></div><div class="orb o3"></div>
-</div>
+<div class="scene"><div class="orb o1"></div><div class="orb o2"></div><div class="orb o3"></div></div>
 
 <!-- LOG POPUP -->
 <div class="log-overlay" id="logOverlay" onclick="closeLogIfOutside(event)">
@@ -748,8 +852,11 @@ body.light .settings-note a{color:#0066cc}
   </div>
 </div>
 
+<!-- FLOAT TIP -->
+<div id="floatTip"></div>
+
 <div class="titlebar">
-  <div class="drag-area" id="dragArea"></div>
+  <div class="drag-area"></div>
   <span class="tb-icon">🎧</span>
   <span class="win-title">Audio Tagger</span>
   <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn">🌙 Dark</button>
@@ -757,16 +864,10 @@ body.light .settings-note a{color:#0066cc}
 
 <div class="layout">
   <nav class="sidebar">
-    <div class="nav-item active" onclick="showPanel('tagger',this)">
-      <span class="nav-icon">🎵</span> Tagger
-    </div>
-    <div class="nav-item" onclick="showPanel('checker',this)">
-      <span class="nav-icon">🔍</span> FLAC Checker
-    </div>
+    <div class="nav-item active" onclick="showPanel('tagger',this)"><span class="nav-icon">🎵</span> Tagger</div>
+    <div class="nav-item" onclick="showPanel('checker',this)"><span class="nav-icon">🔍</span> FLAC Checker</div>
     <div class="sidebar-sep"></div>
-    <div class="nav-item" onclick="showPanel('settings',this)">
-      <span class="nav-icon">⚙️</span> Settings
-    </div>
+    <div class="nav-item" onclick="showPanel('settings',this)"><span class="nav-icon">⚙️</span> Settings</div>
     <div class="sidebar-footer">
       <div class="sidebar-version">v 1.0</div>
       <a class="sidebar-link" href="https://github.com/Nik-Grish/Audio-Tagger">⌥ GitHub</a>
@@ -779,138 +880,144 @@ body.light .settings-note a{color:#0066cc}
     <div class="panel active" id="panel-tagger">
       <div class="field-row">
         <span class="field-lbl">Music folder</span>
-        <input class="glass-input" id="music-path" placeholder="/path/to/music" onchange="loadFileList()">
+        <input class="glass-input" id="music-path" placeholder="Select a folder…">
         <button class="glass-btn icon-btn" onclick="browseFolder('music-path')" title="Browse">📁</button>
-        <button class="glass-btn icon-btn" onclick="loadFileList()" title="Rescan folder">🔄</button>
+        <button class="glass-btn icon-btn" onclick="rescanFolder()" title="Rescan folder">🔄</button>
       </div>
-
       <div class="sep"></div>
-
       <div class="opts-grid">
-
         <div class="opt" onclick="toggleCb('cb-lyrics')">
           <div class="glass-check" id="cb-lyrics"><svg width="10" height="10" viewBox="0 0 10 10"><polyline points="1.5,5 4,7.5 8.5,2.5" fill="none" stroke="white" stroke-width="1.8"/></svg></div>
           <span class="opt-lbl">Add lyrics</span>
-          <div class="tip">Searches Genius API.<br><b>Skips</b> if lyrics tag already present.<br><b>Tries</b> full title first, then without parentheses.<br>Enable "Overwrite" to force-replace.</div>
+          <div class="tip">Searches Genius API.<br><b>Skips</b> if lyrics tag already present.<br>Tries full title first, then without parentheses.<br>Enable "Overwrite all" to force-replace.</div>
         </div>
-
         <div class="opt" onclick="toggleCb('cb-genre')">
           <div class="glass-check" id="cb-genre"><svg width="10" height="10" viewBox="0 0 10 10"><polyline points="1.5,5 4,7.5 8.5,2.5" fill="none" stroke="white" stroke-width="1.8"/></svg></div>
           <span class="opt-lbl">Fetch genre</span>
-          <div class="tip">Fetches top tag from Last.fm (track → artist fallback).<br><b>Skips</b> if genre tag already present.<br>Never overwrites existing genre.</div>
+          <div class="tip">Fetches top tag from Last.fm (track → artist fallback).<br><b>Skips</b> if genre tag already present.</div>
         </div>
-
         <div class="opt" onclick="toggleCb('cb-rg')">
           <div class="glass-check" id="cb-rg"><svg width="10" height="10" viewBox="0 0 10 10"><polyline points="1.5,5 4,7.5 8.5,2.5" fill="none" stroke="white" stroke-width="1.8"/></svg></div>
           <span class="opt-lbl">ReplayGain</span>
-          <div class="tip">Runs <code>rsgain easy</code> on entire folder.<br><b>Always overwrites</b> existing RG tags — rsgain recalculates every time.</div>
+          <div class="tip">Runs rsgain on the entire folder.<br><b>Always overwrites</b> existing RG tags.</div>
         </div>
-
         <div class="opt" onclick="toggleCb('cb-dr')">
           <div class="glass-check" id="cb-dr"><svg width="10" height="10" viewBox="0 0 10 10"><polyline points="1.5,5 4,7.5 8.5,2.5" fill="none" stroke="white" stroke-width="1.8"/></svg></div>
           <span class="opt-lbl">Dynamic Range</span>
-          <div class="tip">Calculates DR14 (Pleasurize Music Foundation standard).<br><b>Always overwrites</b> existing DYNAMIC_RANGE tag.</div>
+          <div class="tip">Calculates DR14 (Pleasurize Music Foundation standard).<br><b>Always overwrites</b> existing DR tag.</div>
         </div>
-
         <div class="opt" onclick="toggleCb('cb-year')">
           <div class="glass-check" id="cb-year"><svg width="10" height="10" viewBox="0 0 10 10"><polyline points="1.5,5 4,7.5 8.5,2.5" fill="none" stroke="white" stroke-width="1.8"/></svg></div>
           <span class="opt-lbl">Fix year tags</span>
-          <div class="tip">Strips month/day from date tags.<br><code>2007-05-14</code> → <code>2007</code><br><b>Skips</b> if tag already 4-digit year.</div>
+          <div class="tip">Strips month/day: 2007-05-14 → 2007<br><b>Skips</b> if already 4-digit year.</div>
         </div>
-
         <div class="opt" onclick="toggleCb('cb-overwrite')">
           <div class="glass-check off" id="cb-overwrite"></div>
           <span class="opt-lbl dim">Overwrite all</span>
-          <div class="tip">Forces re-fetch of lyrics and genre even if tags are already present.<br>Does not affect ReplayGain or DR (always recalculated).</div>
+          <div class="tip">Forces re-fetch of lyrics and genre even if tags are already present.</div>
         </div>
-
       </div>
-
       <div class="sep"></div>
-
       <div class="btn-row">
         <button class="btn-run" id="runBtn" onclick="runTagger()">▶ Run</button>
         <button class="btn-stop" id="stopBtn" onclick="stopTagger()" disabled>⏹ Stop</button>
       </div>
-
       <div class="progress-wrap"><div class="progress-fill" id="taggerProgress"></div></div>
-
-      <!-- TAGGER TABLE -->
       <div class="tbl-wrap" id="taggerTblWrap">
         <table id="taggerTable">
-          <thead>
-            <tr>
-              <th style="width:32px;text-align:center"> </th>
-              <th style="width:28%" onclick="sortTagger(1)">File ↕</th>
-              <th style="width:10%;text-align:center" onclick="sortTagger(2)">RG ↕</th>
-              <th style="width:10%;text-align:center" onclick="sortTagger(3)">DR ↕</th>
-              <th style="width:10%;text-align:center" onclick="sortTagger(4)">Lyrics ↕</th>
-              <th style="width:14%;text-align:center" onclick="sortTagger(5)">Year ↕</th>
-              <th onclick="sortTagger(6)">Genre ↕</th>
-            </tr>
-          </thead>
+          <thead><tr>
+            <th style="width:28px;text-align:center"> </th>
+            <th style="width:24%" onclick="sortTagger(1)">File ↕<div class="col-resizer" onmousedown="startResize(event,this)"></div></th>
+            <th style="width:36px;text-align:center">📁</th>
+            <th style="width:9%;text-align:center" onclick="sortTagger(3)">RG ↕<div class="col-resizer" onmousedown="startResize(event,this)"></div></th>
+            <th style="width:9%;text-align:center" onclick="sortTagger(4)">DR ↕<div class="col-resizer" onmousedown="startResize(event,this)"></div></th>
+            <th style="width:9%;text-align:center" onclick="sortTagger(5)">Lyrics ↕<div class="col-resizer" onmousedown="startResize(event,this)"></div></th>
+            <th style="width:13%;text-align:center" onclick="sortTagger(6)">Year ↕<div class="col-resizer" onmousedown="startResize(event,this)"></div></th>
+            <th onclick="sortTagger(7)">Genre ↕</th>
+          </tr></thead>
           <tbody id="taggerBody"></tbody>
         </table>
       </div>
-
-      <!-- STATUS BAR -->
       <div class="statusbar">
-        <span class="status-text" id="statusText" onclick="openLogPopup()">Ready — click to see log</span>
+        <span class="status-text" id="statusText" onclick="openLogPopup()">Select a folder to begin</span>
       </div>
     </div>
 
     <!-- FLAC CHECKER -->
     <div class="panel" id="panel-checker">
+      <div class="flad-banner hidden" id="fladBanner">
+        <span class="flad-banner-text">⚠️ FLAD not installed — source analysis unavailable. Hi-Res spectrum check and DR14 will still run.</span>
+        <button class="flad-install-btn" onclick="installFlad('fladBannerStatus')">⬇ Install FLAD</button>
+      </div>
+      <div id="fladBannerStatus" style="font-size:11px;color:var(--text-muted);margin-bottom:6px;display:none"></div>
       <div class="field-row" style="margin-bottom:12px">
-        <input class="glass-input" id="checker-path" placeholder="/path/to/music" oninput="document.getElementById('scanBtn').disabled=!this.value.trim()">
+        <input class="glass-input" id="checker-path" placeholder="Select a folder…" oninput="document.getElementById('scanBtn').disabled=!this.value.trim()">
         <button class="glass-btn" onclick="browseFolder('checker-path')">Browse</button>
         <button class="btn-run" style="flex:none;padding:7px 22px;font-size:13px;border-radius:10px" onclick="runChecker()" id="scanBtn" disabled>Scan</button>
         <button class="glass-btn" onclick="openCheckerLog()">Log</button>
       </div>
-
       <div class="tbl-wrap">
         <table id="checkerTable">
-          <thead>
-            <tr>
-              <th style="width:30%" onclick="sortChecker(0)">File ↕</th>
-              <th style="width:14%" onclick="sortChecker(1)">Source ↕</th>
-              <th style="width:17%" onclick="sortChecker(2)">Container ↕</th>
-              <th style="width:8%;text-align:center" onclick="sortChecker(3)">DR ↕</th>
-              <th onclick="sortChecker(4)">Verdict ↕</th>
-            </tr>
-          </thead>
+          <thead><tr>
+            <th style="width:30%" onclick="sortChecker(0)">File ↕</th>
+            <th style="width:14%" onclick="sortChecker(1)">Source ↕</th>
+            <th style="width:17%" onclick="sortChecker(2)">Container ↕</th>
+            <th style="width:8%;text-align:center" onclick="sortChecker(3)">DR ↕</th>
+            <th onclick="sortChecker(4)">Verdict ↕</th>
+          </tr></thead>
           <tbody id="checkerBody"></tbody>
         </table>
       </div>
-
       <div class="summary" id="checkerSummary">Ready to scan</div>
       <div class="checker-progress-wrap"><div class="checker-progress-fill" id="checkerProgress"></div></div>
     </div>
 
     <!-- SETTINGS -->
     <div class="panel" id="panel-settings">
-      <div class="field-row">
-        <span class="field-lbl">Genius token</span>
-        <input class="glass-input" id="genius-token" type="password" placeholder="Genius API token">
-      </div>
-      <div class="field-row">
-        <span class="field-lbl">Last.fm key</span>
-        <input class="glass-input" id="lastfm-key" type="password" placeholder="Last.fm API key">
-      </div>
-      <div class="field-row">
-        <span class="field-lbl">Log path</span>
-        <input class="glass-input" id="log-path" placeholder="Empty = saves to music folder">
-      </div>
-      <div class="field-row">
-        <span class="field-lbl">FLAD path</span>
-        <input class="glass-input" id="flad-dir" placeholder="/path/to/FLAD (optional)">
-      </div>
-      <div class="sep"></div>
-      <button class="save-btn" onclick="saveSettings()">Save</button>
-      <div class="settings-note">
-        Genius token: <a href="https://genius.com/api-clients">genius.com/api-clients</a><br>
-        Last.fm key: <a href="https://www.last.fm/api/account/create">last.fm/api/account/create</a><br>
-        Settings are saved to <code>config.txt</code> next to the app.
+      <div class="settings-scroll">
+        <div class="field-row">
+          <span class="field-lbl">Genius token</span>
+          <input class="glass-input" id="genius-token" type="password" placeholder="Genius API token">
+        </div>
+        <div class="field-row">
+          <span class="field-lbl">Last.fm key</span>
+          <input class="glass-input" id="lastfm-key" type="password" placeholder="Last.fm API key">
+        </div>
+        <div class="field-row">
+          <span class="field-lbl">Music folder</span>
+          <input class="glass-input" id="settings-music" placeholder="Default music folder">
+          <button class="glass-btn icon-btn" onclick="browseFolder('settings-music')" title="Browse">📁</button>
+        </div>
+        <div class="field-row">
+          <span class="field-lbl">Log folder</span>
+          <input class="glass-input" id="log-path" placeholder="Empty = saves to music folder">
+          <button class="glass-btn icon-btn" onclick="browseFolder('log-path')" title="Browse">📁</button>
+        </div>
+        <div class="field-row">
+          <span class="field-lbl">FLAD path</span>
+          <input class="glass-input" id="flad-dir" placeholder="/path/to/FLAD (optional)">
+        </div>
+        <div class="sep"></div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="save-btn" onclick="saveSettings()">Save</button>
+          <button class="glass-btn" onclick="openConfig()">📄 Open config.txt</button>
+        </div>
+
+        <div class="sep"></div>
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">
+          <b style="color:var(--text)">App updates</b><br>
+          Current version: <b style="color:var(--text)" class="app-version">v1.0</b>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="glass-btn" onclick="checkUpdates()" id="checkUpdBtn">🔄 Check for updates</button>
+          <button class="save-btn" id="downloadUpdateBtn" style="display:none" onclick="downloadUpdate()">⬇ Download update</button>
+        </div>
+        <div id="updateStatus" style="font-size:11px;color:var(--text-muted);margin-top:8px;line-height:1.8"></div>
+        <div class="settings-note">
+          Genius token: <a href="https://genius.com/api-clients">genius.com/api-clients</a><br>
+          Last.fm key: <a href="https://www.last.fm/api/account/create">last.fm/api/account/create</a><br>
+          Config: <code>~/Library/Application Support/AudioTagger/config.txt</code>
+        </div>
       </div>
     </div>
 
@@ -919,15 +1026,15 @@ body.light .settings-note a{color:#0066cc}
 
 <script>
 // ─── THEME ───────────────────────────────────────────────
-let isDark = true;
+let isDark=true;
 function toggleTheme(){
-  isDark = !isDark;
-  document.getElementById('body').className = isDark ? '' : 'light';
-  document.getElementById('themeBtn').textContent = isDark ? '🌙 Dark' : '☀️ Light';
+  isDark=!isDark;
+  document.getElementById('body').className=isDark?'':'light';
+  document.getElementById('themeBtn').textContent=isDark?'🌙 Dark':'☀️ Light';
 }
 
 // ─── NAV ─────────────────────────────────────────────────
-function showPanel(name, el){
+function showPanel(name,el){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
   document.getElementById('panel-'+name).classList.add('active');
@@ -942,31 +1049,32 @@ function toggleCb(id){
   if(cbState[id]){
     el.classList.remove('off');
     el.innerHTML='<svg width="10" height="10" viewBox="0 0 10 10"><polyline points="1.5,5 4,7.5 8.5,2.5" fill="none" stroke="white" stroke-width="1.8"/></svg>';
-    const lbl=el.nextElementSibling;
-    if(lbl){lbl.classList.remove('dim');}
-  } else {
-    el.classList.add('off');
-    el.innerHTML='';
-    const lbl=el.nextElementSibling;
-    if(lbl){lbl.classList.add('dim');}
+    const lbl=el.nextElementSibling;if(lbl)lbl.classList.remove('dim');
+  }else{
+    el.classList.add('off');el.innerHTML='';
+    const lbl=el.nextElementSibling;if(lbl)lbl.classList.add('dim');
   }
 }
 
 // ─── BROWSE ──────────────────────────────────────────────
 function browseFolder(inputId){
   window.pywebview.api.browse_folder().then(path=>{
-    if(path){
-      document.getElementById(inputId).value=path;
-      if(inputId==='music-path'){
-        // Sync to checker only if checker path is empty
-        const checkerPath=document.getElementById('checker-path');
-        if(!checkerPath.value.trim()) checkerPath.value=path;
-        loadFileList();
-      }
-      if(inputId==='checker-path'){
-        // Enable Scan button when checker path is set
-        document.getElementById('scanBtn').disabled=!path.trim();
-      }
+    if(!path)return;
+    document.getElementById(inputId).value=path;
+    if(inputId==='music-path'){
+      // Sync checker only if empty
+      const cp=document.getElementById('checker-path');
+      if(!cp.value.trim())cp.value=path;
+      // Save to config immediately
+      window.pywebview.api.save_music_root(path);
+      loadFileList();
+    }
+    if(inputId==='checker-path'){
+      document.getElementById('scanBtn').disabled=!path.trim();
+    }
+    if(inputId==='settings-music'){
+      document.getElementById('music-path').value=path;
+      window.pywebview.api.save_music_root(path);
     }
   });
 }
@@ -986,60 +1094,57 @@ function openLogPopup(){
 function closeLog(){document.getElementById('logOverlay').classList.remove('open')}
 function closeLogIfOutside(e){if(e.target===document.getElementById('logOverlay'))closeLog()}
 
-// ─── STATUS BAR ──────────────────────────────────────────
+// ─── STATUS ──────────────────────────────────────────────
 function setStatus(msg,isErr){
   const el=document.getElementById('statusText');
-  el.textContent=msg+' — click to see log';
+  el.textContent=msg+(msg&&!isErr?' — click to see log':'');
   el.className='status-text'+(isErr?' err':'');
 }
 
 // ─── TAGGER TABLE ────────────────────────────────────────
-let taggerRows={};  // filepath -> row data
+let taggerRows={};
 let taggerSortDir={};
 
 function loadFileList(){
   const path=document.getElementById('music-path').value.trim();
-  if(!path)return;
+  if(!path){setStatus('Select a folder to begin');return;}
   taggerRows={};
   document.getElementById('taggerBody').innerHTML='';
-  setStatus('Scanning folder...');
+  setStatus('Scanning folder…');
   window.pywebview.api.get_file_list(path).then(files=>{
+    if(!files||!files.length){setStatus('No audio files found');return;}
     files.forEach(f=>addTaggerRow(f,'pending'));
-    setStatus('Ready — '+files.length+' files');
-  });
+    setStatus('Ready — '+files.length+' files found');
+  }).catch(e=>setStatus('Error scanning: '+e,true));
 }
 
-function addTaggerRow(fileInfo, status){
-  const id='row-'+btoa(unescape(encodeURIComponent(fileInfo.path))).replace(/[^a-zA-Z0-9]/g,'');
-  taggerRows[fileInfo.path]={...fileInfo, status,
-    rg: fileInfo.rg || '—',
-    dr: fileInfo.dr || '—',
-    lyrics: fileInfo.lyrics ? 'Yes' : 'No',
-    year: fileInfo.year || '—',
-    genre: fileInfo.genre || '—',
-    id};
+function rescanFolder(){loadFileList();}
 
+function addTaggerRow(fi,status){
+  const id='r'+Math.random().toString(36).slice(2);
+  taggerRows[fi.path]={...fi,status,rg:fi.rg||'—',dr:fi.dr||'—',
+    lyrics:fi.lyrics?'Yes':'No',year:fi.year||'—',genre:fi.genre||'—',id};
   const tbody=document.getElementById('taggerBody');
-  const tr=document.createElement('tr');
-  tr.id=id;
-  tr.innerHTML=rowHtml(taggerRows[fileInfo.path]);
+  const tr=document.createElement('tr');tr.id=id;tr.innerHTML=rowHtml(taggerRows[fi.path]);
   tbody.appendChild(tr);
 }
 
-function updateTaggerRow(path, updates){
+function updateTaggerRow(path,updates){
   if(!taggerRows[path])return;
-  Object.assign(taggerRows[path], updates);
+  Object.assign(taggerRows[path],updates);
   const tr=document.getElementById(taggerRows[path].id);
-  if(tr) tr.innerHTML=rowHtml(taggerRows[path]);
+  if(tr)tr.innerHTML=rowHtml(taggerRows[path]);
 }
 
-const STATUS_ICON={pending:'○', running:'⏳', ok:'✅', err:'❌', skip:'⏩', skip_tag:'➖'};
+const STATUS_ICON={pending:'○',running:'⏳',ok:'✅',err:'❌',skip:'⏩'};
 
 function rowHtml(r){
-  const icon=STATUS_ICON[r.status]||'⬜';
+  const icon=STATUS_ICON[r.status]||'○';
   const lyricsCls=r.lyrics==='Yes'?'style="color:#30d158"':'style="color:var(--text-muted)"';
+  const enc=encodeURIComponent(r.path);
   return `<td style="text-align:center;font-size:14px">${icon}</td>
     <td title="${escHtml(r.path)}">${escHtml(r.file)}</td>
+    <td style="text-align:center"><button class="finder-btn" onclick="revealInFinder('${escHtml(r.path)}')" title="Show in Finder">🔍</button></td>
     <td style="text-align:center;font-family:var(--mono);font-size:11px">${escHtml(r.rg)}</td>
     <td style="text-align:center;font-family:var(--mono);font-size:11px">${escHtml(r.dr)}</td>
     <td style="text-align:center" ${lyricsCls}>${escHtml(r.lyrics)}</td>
@@ -1047,51 +1152,61 @@ function rowHtml(r){
     <td>${escHtml(r.genre)}</td>`;
 }
 
+function revealInFinder(path){
+  window.pywebview.api.reveal_in_finder(path);
+}
+
 function sortTagger(col){
-  const keys=['status','file','rg','dr','lyrics','year','genre'];
+  const keys=['status','file','finder','rg','dr','lyrics','year','genre'];
   const key=keys[col];
+  if(key==='finder')return;
   taggerSortDir[key]=!taggerSortDir[key];
   const rows=Object.values(taggerRows);
   rows.sort((a,b)=>{
-    const av=String(a[key]||''); const bv=String(b[key]||'');
+    const av=String(a[key]||'');const bv=String(b[key]||'');
     return taggerSortDir[key]?av.localeCompare(bv):bv.localeCompare(av);
   });
-  const tbody=document.getElementById('taggerBody');
-  tbody.innerHTML='';
-  rows.forEach(r=>{
-    const tr=document.createElement('tr');
-    tr.id=r.id; tr.innerHTML=rowHtml(r);
-    tbody.appendChild(tr);
-  });
+  const tbody=document.getElementById('taggerBody');tbody.innerHTML='';
+  rows.forEach(r=>{const tr=document.createElement('tr');tr.id=r.id;tr.innerHTML=rowHtml(r);tbody.appendChild(tr);});
 }
 
 // ─── TAGGER RUN ──────────────────────────────────────────
 function runTagger(){
   const path=document.getElementById('music-path').value.trim();
   if(!path){setStatus('Music folder not set',true);return;}
+  if(!Object.keys(taggerRows).length){
+    // Scan first, then run
+    setStatus('Scanning folder…');
+    window.pywebview.api.get_file_list(path).then(files=>{
+      if(!files||!files.length){setStatus('No audio files found',true);return;}
+      taggerRows={};
+      document.getElementById('taggerBody').innerHTML='';
+      files.forEach(f=>addTaggerRow(f,'pending'));
+      _doRun(path);
+    });
+    return;
+  }
+  _doRun(path);
+}
+
+function _doRun(path){
   logLines=[];
   document.getElementById('runBtn').disabled=true;
   document.getElementById('stopBtn').disabled=false;
+  document.getElementById('stopBtn').textContent='⏹ Stop';
   document.getElementById('taggerProgress').style.width='0%';
-
-  // Reset all rows to pending
   Object.keys(taggerRows).forEach(p=>updateTaggerRow(p,{status:'pending',rg:'—',dr:'—'}));
-
-  const opts={
-    music_root:path,
-    lyrics:cbState['cb-lyrics'],genre:cbState['cb-genre'],
-    replaygain:cbState['cb-rg'],dr:cbState['cb-dr'],
-    year:cbState['cb-year'],overwrite:cbState['cb-overwrite'],
-  };
+  const opts={music_root:path,lyrics:cbState['cb-lyrics'],genre:cbState['cb-genre'],
+    replaygain:cbState['cb-rg'],dr:cbState['cb-dr'],year:cbState['cb-year'],overwrite:cbState['cb-overwrite']};
   window.pywebview.api.run_tagger(opts);
 }
+
 function stopTagger(){
   window.pywebview.api.stop_tagger();
   document.getElementById('stopBtn').disabled=true;
-  document.getElementById('stopBtn').textContent='⏹ Stopping...';
+  document.getElementById('stopBtn').textContent='⏹ Stopping…';
 }
 
-// Called from Python
 function onLog(msg,type){appendLog(msg,type)}
 function onProgress(pct){document.getElementById('taggerProgress').style.width=Math.round(pct*100)+'%'}
 function onStatus(msg,isErr){setStatus(msg,isErr||false)}
@@ -1101,18 +1216,16 @@ function onTaggerDone(){
   document.getElementById('stopBtn').disabled=true;
   document.getElementById('stopBtn').textContent='⏹ Stop';
   document.getElementById('taggerProgress').style.width='100%';
-  setStatus('Done');
 }
 
-// ─── CHECKER TABLE ───────────────────────────────────────
-let checkerData=[];
-let checkerSortDir={};
+// ─── CHECKER ─────────────────────────────────────────────
+let checkerData=[];let checkerSortDir={};
 const VERDICT_TIPS={
-  hires:'Source is lossless and spectrum analysis confirms real content above 22 kHz — genuine Hi-Res recording.',
-  cd:'16bit/44.1kHz container. Standard CD quality — no upscaling detected.',
-  upscale:'Lossless source but very little energy above 22 kHz — likely upscaled from a CD master.',
-  suspicious:'Low high-frequency content (below 16 kHz). Possible lossy upscale or heavily compressed master.',
-  fake:'FLAD model detected lossy codec artifacts (MP3/AAC/Opus) in the spectrum — fake lossless.',
+  hires:'FLAD: lossless source confirmed. Spectrum shows real content above 22kHz — genuine Hi-Res recording.',
+  cd:'16bit/44.1kHz container. Standard CD quality detected. No upscaling artifacts.',
+  upscale:'FLAD: lossless source. But spectrum shows almost no energy above 22kHz — likely upscaled from CD master.',
+  suspicious:'Low high-frequency content (below 16kHz). Possible lossy upscale or heavily compressed/processed master.',
+  fake:'FLAD model detected lossy artifacts in spectrum. MP3/AAC/Opus codec fingerprint identified — fake lossless file.',
   error:'Analysis could not be completed for this file.',
 };
 const VERDICT_MAP={
@@ -1121,10 +1234,7 @@ const VERDICT_MAP={
   fake:['b-err','Fake lossless'],error:['','Error'],
 };
 
-function onCheckerRow(row){
-  checkerData.push(row);
-  renderCheckerTable();
-}
+function onCheckerRow(row){checkerData.push(row);renderCheckerTable()}
 function onCheckerProgress(pct){document.getElementById('checkerProgress').style.width=Math.round(pct*100)+'%'}
 function onCheckerDone(summary){
   document.getElementById('checkerSummary').innerHTML=summary;
@@ -1137,27 +1247,15 @@ function renderCheckerTable(){
   tbody.innerHTML=checkerData.map(r=>{
     const [cls,label]=VERDICT_MAP[r.verdict_key]||['',r.verdict];
     const tip=VERDICT_TIPS[r.verdict_key]||'';
-    const badge=cls
-      ?`<span class="badge ${cls}" data-tip="${escHtml(tip)}">${escHtml(label)}</span>`
-      :escHtml(label);
-    return `<tr>
-      <td title="${escHtml(r.file)}">${escHtml(r.file)}</td>
-      <td>${escHtml(r.source)}</td>
-      <td>${escHtml(r.container)}</td>
-      <td style="text-align:center;font-family:var(--mono)">${escHtml(r.dr)}</td>
-      <td>${badge}</td>
-    </tr>`;
+    const badge=cls?`<span class="badge ${cls}" data-tip="${escHtml(tip)}">${escHtml(label)}</span>`:escHtml(label);
+    return `<tr><td title="${escHtml(r.file)}">${escHtml(r.file)}</td><td>${escHtml(r.source)}</td><td>${escHtml(r.container)}</td><td style="text-align:center;font-family:var(--mono)">${escHtml(r.dr)}</td><td>${badge}</td></tr>`;
   }).join('');
 }
 
 function sortChecker(col){
-  const keys=['file','source','container','dr','verdict'];
-  const key=keys[col];
+  const keys=['file','source','container','dr','verdict'];const key=keys[col];
   checkerSortDir[key]=!checkerSortDir[key];
-  checkerData.sort((a,b)=>{
-    const av=String(a[key]||'');const bv=String(b[key]||'');
-    return checkerSortDir[key]?av.localeCompare(bv):bv.localeCompare(av);
-  });
+  checkerData.sort((a,b)=>{const av=String(a[key]||'');const bv=String(b[key]||'');return checkerSortDir[key]?av.localeCompare(bv):bv.localeCompare(av);});
   renderCheckerTable();
 }
 
@@ -1165,82 +1263,173 @@ function runChecker(){
   const path=document.getElementById('checker-path').value.trim();
   if(!path)return;
   document.getElementById('checkerBody').innerHTML='';
-  document.getElementById('checkerSummary').textContent='Scanning...';
+  document.getElementById('checkerSummary').textContent='Scanning…';
   document.getElementById('scanBtn').disabled=true;
   document.getElementById('checkerProgress').style.width='0%';
   checkerData=[];
   window.pywebview.api.run_checker(path);
 }
 
-let checkerLogPath=null;
-function openCheckerLog(){
-  window.pywebview.api.open_log();
-}
+function openCheckerLog(){window.pywebview.api.open_log()}
 
 // ─── SETTINGS ────────────────────────────────────────────
 function saveSettings(){
-  window.pywebview.api.save_settings({
+  const data={
     genius_token:document.getElementById('genius-token').value.trim(),
     lastfm_key:document.getElementById('lastfm-key').value.trim(),
     log_path:document.getElementById('log-path').value.trim(),
     flad_dir:document.getElementById('flad-dir').value.trim(),
-  }).then(()=>{appendLog('✓ Settings saved','ok');setStatus('Settings saved')});
+    music_root:document.getElementById('settings-music').value.trim(),
+  };
+  window.pywebview.api.save_settings(data).then(()=>{
+    appendLog('✓ Settings saved','ok');
+    setStatus('Settings saved');
+    // Sync music-path
+    if(data.music_root){
+      document.getElementById('music-path').value=data.music_root;
+    }
+  });
+}
+
+function openConfig(){window.pywebview.api.open_config()}
+
+function installFlad(statusId){
+  const btn=event.target;
+  btn.disabled=true;
+  const statusEl=document.getElementById(statusId);
+  if(statusEl){statusEl.style.display='block';statusEl.textContent='Installing FLAD… this may take a minute';}
+  window.pywebview.api.install_flad().then(result=>{
+    if(statusEl){statusEl.textContent=result.message;statusEl.style.color=result.ok?'#30d158':'#ff453a';}
+    btn.disabled=false;
+    if(result.ok){
+      document.getElementById('flad-dir').value=result.path;
+      document.getElementById('fladBanner').classList.add('hidden');
+    }
+  });
+}
+
+function syncScanBtn(){
+  const path=document.getElementById('checker-path').value.trim();
+  document.getElementById('scanBtn').disabled=!path;
 }
 
 function loadSettings(cfg){
-  if(cfg.GENIUS_TOKEN&&cfg.GENIUS_TOKEN!=='YOUR_GENIUS_API_TOKEN')
-    document.getElementById('genius-token').value=cfg.GENIUS_TOKEN;
-  if(cfg.LASTFM_KEY&&cfg.LASTFM_KEY!=='YOUR_LASTFM_API_KEY')
-    document.getElementById('lastfm-key').value=cfg.LASTFM_KEY;
-  if(cfg.LOG_PATH)  document.getElementById('log-path').value=cfg.LOG_PATH;
-  if(cfg.FLAD_DIR)  document.getElementById('flad-dir').value=cfg.FLAD_DIR;
-  if(cfg.MUSIC_ROOT){
-    document.getElementById('music-path').value=cfg.MUSIC_ROOT;
-    // Sync to checker only if it's empty
-    const cp=document.getElementById('checker-path');
-    if(!cp.value.trim()) cp.value=cfg.MUSIC_ROOT;
-    // Enable Scan button if path is set
-    document.getElementById('scanBtn').disabled=!cfg.MUSIC_ROOT.trim();
+  // Only fill if value is non-empty and not placeholder
+  // Set version from Python
+  if(cfg._app_version){
+    document.querySelectorAll('.app-version').forEach(el=>el.textContent=cfg._app_version);
   }
+  if(cfg.GENIUS_TOKEN&&cfg.GENIUS_TOKEN!=='YOUR_GENIUS_API_TOKEN'&&cfg.GENIUS_TOKEN.length>4)
+    document.getElementById('genius-token').value=cfg.GENIUS_TOKEN;
+  if(cfg.LASTFM_KEY&&cfg.LASTFM_KEY!=='YOUR_LASTFM_API_KEY'&&cfg.LASTFM_KEY.length>4)
+    document.getElementById('lastfm-key').value=cfg.LASTFM_KEY;
+  if(cfg.LOG_PATH) document.getElementById('log-path').value=cfg.LOG_PATH;
+  if(cfg.FLAD_DIR) document.getElementById('flad-dir').value=cfg.FLAD_DIR;
+  if(cfg.MUSIC_ROOT&&cfg.MUSIC_ROOT.trim()){
+    document.getElementById('music-path').value=cfg.MUSIC_ROOT;
+    document.getElementById('settings-music').value=cfg.MUSIC_ROOT;
+    const cp=document.getElementById('checker-path');
+    if(!cp.value.trim())cp.value=cfg.MUSIC_ROOT;
+    // Enable scan button if checker path is set
+    const scanBtn=document.getElementById('scanBtn');
+    if(scanBtn && cp.value.trim()) scanBtn.disabled=false;
+  }
+  // Check FLAD availability
+  window.pywebview.api.check_flad().then(ok=>{
+    if(!ok)document.getElementById('fladBanner').classList.remove('hidden');
+  });
+}
+
+// ─── CHECK UPDATES ──────────────────────────────────────
+let _latestRelease = null;
+
+function checkUpdates(){
+  const btn=document.getElementById('checkUpdBtn');
+  const status=document.getElementById('updateStatus');
+  const dlBtn=document.getElementById('downloadUpdateBtn');
+  btn.disabled=true;
+  dlBtn.style.display='none';
+  status.textContent='Checking GitHub…';
+  window.pywebview.api.check_updates().then(r=>{
+    btn.disabled=false;
+    if(r.error){
+      status.innerHTML='❌ '+escHtml(r.error);
+      return;
+    }
+    _latestRelease = r;
+    const current=document.querySelector('.app-version').textContent||'v1.0';
+    const latest=r.latest_version||'unknown';
+    const hasUpdate = latest !== current && latest !== 'unknown';
+    let lines=[];
+    lines.push('Current version: <b>'+escHtml(current)+'</b>');
+    lines.push('Latest on GitHub: <b>'+escHtml(latest)+'</b>');
+    if(hasUpdate){
+      lines.push('<span style="color:#30d158">✅ Update available!</span>');
+      dlBtn.style.display='inline-block';
+    } else {
+      lines.push('<span style="color:#30d158">✅ You are up to date</span>');
+    }
+    if(r.release_notes) lines.push('<br><i style="color:var(--text-muted)">'+escHtml(r.release_notes.slice(0,200))+'…</i>');
+    status.innerHTML=lines.join('<br>');
+  }).catch(e=>{btn.disabled=false;status.textContent='Error: '+e;});
+}
+
+function downloadUpdate(){
+  if(_latestRelease && _latestRelease.release_url){
+    window.pywebview.api.open_url(_latestRelease.release_url);
+  }
+}
+
+// ─── FLOAT TOOLTIP ───────────────────────────────────────
+const floatTip=document.getElementById('floatTip');
+document.addEventListener('mouseover',e=>{
+  const b=e.target.closest('.badge[data-tip]');
+  if(b&&b.dataset.tip){floatTip.textContent=b.dataset.tip;floatTip.style.display='block';}
+});
+document.addEventListener('mousemove',e=>{
+  if(floatTip.style.display==='block'){
+    floatTip.style.left=Math.min(e.clientX+12,window.innerWidth-300)+'px';
+    floatTip.style.top=Math.max(e.clientY-floatTip.offsetHeight-8,4)+'px';
+  }
+});
+document.addEventListener('mouseout',e=>{if(e.target.closest('.badge[data-tip]'))floatTip.style.display='none';});
+
+// ─── COLUMN RESIZE ───────────────────────────────────────
+let _resizing = null;
+
+function startResize(e, handle) {
+  e.preventDefault();
+  e.stopPropagation(); // prevent sort trigger
+  const th = handle.parentElement;
+  const startX = e.clientX;
+  const startW = th.offsetWidth;
+  handle.classList.add('active');
+  _resizing = { th, startX, startW, handle };
+
+  function onMove(e) {
+    if (!_resizing) return;
+    const delta = e.clientX - _resizing.startX;
+    const newW = Math.max(40, _resizing.startW + delta);
+    _resizing.th.style.width = newW + 'px';
+  }
+
+  function onUp() {
+    if (_resizing) _resizing.handle.classList.remove('active');
+    _resizing = null;
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+  }
+
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
 }
 
 // ─── UTILS ───────────────────────────────────────────────
-function escHtml(s){
-  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
-// ─── FLOATING TOOLTIP ────────────────────────────────────
-const floatTip = document.createElement('div');
-floatTip.id = 'floatTip';
-document.body.appendChild(floatTip);
-
-document.addEventListener('mouseover', e => {
-  const badge = e.target.closest('.badge[data-tip]');
-  if (badge) {
-    floatTip.textContent = badge.dataset.tip;
-    floatTip.style.display = 'block';
-  }
-});
-document.addEventListener('mousemove', e => {
-  if (floatTip.style.display === 'block') {
-    const x = e.clientX + 12;
-    const y = e.clientY - floatTip.offsetHeight - 8;
-    floatTip.style.left = Math.min(x, window.innerWidth - 300) + 'px';
-    floatTip.style.top = Math.max(y, 4) + 'px';
-  }
-});
-document.addEventListener('mouseout', e => {
-  if (e.target.closest('.badge[data-tip]')) {
-    floatTip.style.display = 'none';
-  }
-});
+function escHtml(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 
 // Init
 window.addEventListener('pywebviewready',()=>{
-  window.pywebview.api.get_config().then(cfg=>{
-    loadSettings(cfg);
-    if(cfg.MUSIC_ROOT) loadFileList();
-  });
+  window.pywebview.api.get_config().then(cfg=>loadSettings(cfg));
 });
 </script>
 </body>
@@ -1251,6 +1440,54 @@ window.addEventListener('pywebviewready',()=>{
 # ============================================================
 # PYTHON API
 # ============================================================
+
+def interpret_error(err: str, context: str = '') -> str:
+    """Convert cryptic error messages into human-readable explanations."""
+    e = err.lower()
+    # Genius API errors
+    if '401' in err:
+        return f'❌ Genius: Invalid or expired token (401). Go to Settings → update Genius token at genius.com/api-clients'
+    if '403' in err:
+        return f'❌ Genius: Access denied (403). Your token may have been revoked.'
+    if '429' in err:
+        return f'❌ Genius: Rate limit exceeded (429). Too many requests — wait a few minutes and retry.'
+    if '404' in err and 'genius' in context:
+        return f'❌ Genius: Song not found (404).'
+    if '500' in err or '502' in err or '503' in err:
+        return f'❌ Server error ({err[:3]}). Genius/Last.fm may be down — try again later.'
+    if 'unexpected response status' in e:
+        code = ''.join(c for c in err if c.isdigit())[:3]
+        msgs = {'401':'Invalid token — update in Settings','403':'Access denied','404':'Not found',
+                '429':'Rate limit — wait and retry','500':'Server error'}
+        hint = msgs.get(code, 'unexpected server response')
+        return f'❌ API error {code}: {hint}'
+    # Network errors
+    if 'connection reset' in e or 'connection refused' in e:
+        return f'❌ Network: Connection reset. Check internet connection.'
+    if 'timed out' in e or 'timeout' in e:
+        return f'❌ Network: Request timed out. Check internet connection or try again.'
+    if 'name or service not known' in e or 'nodename nor servname' in e:
+        return f'❌ Network: DNS error — cannot reach server. Check internet connection.'
+    if 'ssl' in e or 'certificate' in e:
+        return f'❌ SSL error: Certificate verification failed. Try reinstalling Python certificates.'
+    # File errors
+    if 'permission denied' in e:
+        return f'❌ Permission denied: Cannot write to file. Check folder permissions.'
+    if 'no such file' in e or 'not found' in e:
+        return f'❌ File not found: {err[:80]}'
+    if 'disk full' in e or 'no space' in e:
+        return f'❌ Disk full: Free up space and retry.'
+    # rsgain / ffmpeg
+    if 'rsgain' in e:
+        return f'❌ rsgain error: {err[:80]}'
+    if 'ffmpeg' in e:
+        return f'❌ ffmpeg error: {err[:80]}'
+    # Last.fm
+    if 'lastfm' in context or 'last.fm' in e:
+        return f'❌ Last.fm error: {err[:80]}. Check your API key in Settings.'
+    # Generic
+    return f'❌ Error: {err[:120]}'
+
 
 class Api:
     def __init__(self, window_ref):
@@ -1263,7 +1500,10 @@ class Api:
         self._win.evaluate_js(f'{fn}({arg_str})')
 
     def get_config(self):
-        return load_config()
+        cfg = load_config()
+        # Re-read version fresh each time to catch bundled version.txt
+        cfg['_app_version'] = get_app_version()
+        return cfg
 
     def browse_folder(self):
         result = self._win.create_file_dialog(webview.FOLDER_DIALOG, allow_multiple=False)
@@ -1275,19 +1515,39 @@ class Api:
         if self._win.maximized: self._win.restore()
         else: self._win.maximize()
 
+    def save_music_root(self, path: str):
+        """Save MUSIC_ROOT immediately when folder is changed."""
+        cfg = load_config()
+        cfg['MUSIC_ROOT'] = path
+        save_config(cfg)
+
     def save_settings(self, data: dict):
         cfg = load_config()
+        # Only update non-empty values
         if data.get('genius_token'): cfg['GENIUS_TOKEN'] = data['genius_token']
         if data.get('lastfm_key'):   cfg['LASTFM_KEY']   = data['lastfm_key']
-        cfg['LOG_PATH']  = data.get('log_path', '')
-        cfg['FLAD_DIR']  = data.get('flad_dir', '')
+        if 'log_path'   in data:     cfg['LOG_PATH']     = data['log_path']
+        if 'flad_dir'   in data:     cfg['FLAD_DIR']     = data['flad_dir']
+        if data.get('music_root'):   cfg['MUSIC_ROOT']   = data['music_root']
         save_config(cfg)
+
+    def open_config(self):
+        """Open config.txt in default text editor."""
+        subprocess.run(['open', CONFIG_PATH])
 
     def stop_tagger(self):
         self._stop = True
 
+    def check_flad(self) -> bool:
+        """Returns True if FLAD model is available (bundled or installed)."""
+        return bool(get_flad_dir())
+
+    def reveal_in_finder(self, path: str):
+        """Reveal file in macOS Finder."""
+        subprocess.run(['open', '-R', path])
+
     def get_file_list(self, path: str):
-        """Returns list of file info dicts including existing RG/DR/lyrics/year/genre."""
+        """Scan folder and return file info list with existing tags."""
         files = scan_audio_files(path)
         result = []
         for fp in files:
@@ -1296,24 +1556,19 @@ class Api:
             year_val = fix_year(year_raw) if year_raw else '—'
             has_l = has_lyrics(fp)
 
-            # Read genre
             genre_val = ''
             try:
                 if ext == 'mp3':
-                    a = MP3(fp, ID3=ID3)
-                    tcon = (a.tags or {}).get('TCON')
+                    a = MP3(fp, ID3=ID3); tcon = (a.tags or {}).get('TCON')
                     genre_val = str(tcon.text[0]) if tcon else ''
                 elif ext == 'flac':
                     genre_val = FLAC(fp).get('genre', [''])[0]
                 elif ext == 'm4a':
-                    v = (MP4(fp).tags or {}).get('\xa9gen')
-                    genre_val = v[0] if v else ''
+                    v = (MP4(fp).tags or {}).get('\xa9gen'); genre_val = v[0] if v else ''
                 elif ext == 'ogg':
                     genre_val = OggVorbis(fp).get('genre', [''])[0]
-            except Exception:
-                pass
+            except Exception: pass
 
-            # Read existing DR tag
             dr_val = '—'
             try:
                 if ext == 'mp3':
@@ -1330,15 +1585,12 @@ class Api:
                 elif ext == 'ogg':
                     v = OggVorbis(fp).get('DYNAMIC_RANGE', [None])[0]
                     if v: dr_val = f'DR{v}'
-            except Exception:
-                pass
+            except Exception: pass
 
-            # Read existing ReplayGain tag
             rg_val = '—'
             try:
                 if ext == 'mp3':
-                    t = EasyID3(fp)
-                    v = t.get('replaygain_track_gain', [None])[0]
+                    t = EasyID3(fp); v = t.get('replaygain_track_gain', [None])[0]
                     if v: rg_val = v
                 elif ext == 'flac':
                     v = FLAC(fp).get('replaygain_track_gain', [None])[0]
@@ -1346,17 +1598,12 @@ class Api:
                 elif ext == 'ogg':
                     v = OggVorbis(fp).get('replaygain_track_gain', [None])[0]
                     if v: rg_val = v
-            except Exception:
-                pass
+            except Exception: pass
 
             result.append({
-                'path':   fp,
-                'file':   os.path.basename(fp),
-                'year':   year_val,
-                'lyrics': has_l,
-                'genre':  genre_val,
-                'dr':     dr_val,
-                'rg':     rg_val,
+                'path': fp, 'file': os.path.basename(fp),
+                'year': year_val, 'lyrics': has_l,
+                'genre': genre_val, 'dr': dr_val, 'rg': rg_val,
             })
         return result
 
@@ -1375,10 +1622,15 @@ class Api:
                 def status(msg, err=False): self._js('onStatus', msg, err)
                 def row(path, updates): self._js('onRowUpdate', path, updates)
 
-                status('Scanning folder...')
-                log(f'Scanning {music_root}...', 'info')
+                # Step 1: scan folder if needed
+                status('Scanning folder…')
+                log(f'Scanning {music_root}…', 'info')
                 files = scan_audio_files(music_root)
                 total = len(files)
+                if not total:
+                    status('No audio files found', True)
+                    self._js('onTaggerDone')
+                    return
                 log(f'Found {total} files', 'ok')
 
                 genius_client = None
@@ -1388,48 +1640,53 @@ class Api:
                     genius_client.verbose = False
                     genius_client.remove_section_headers = False
 
-                # ReplayGain — run first on entire folder
-                if opts.get('replaygain'):
-                    status('Applying ReplayGain...')
-                    log('Applying ReplayGain...', 'info')
-                    res = subprocess.run(
-                        ['/opt/homebrew/bin/rsgain', 'easy', music_root],
-                        capture_output=True, text=True
-                    )
-                    if res.returncode == 0:
-                        log('✓ ReplayGain done', 'ok')
-                        # Parse per-track gain from rsgain output
-                        current_file = None
-                        rg_map = {}
-                        for line in res.stdout.splitlines():
-                            line = line.strip()
-                            if line.startswith('Track:'):
-                                current_file = line.replace('Track:', '').strip()
-                            elif 'Gain:' in line and current_file:
-                                gain = line.split('Gain:')[-1].strip().split()[0]
-                                rg_map[current_file] = gain
-                                log(f'  RG {os.path.basename(current_file)}: {gain} dB', 'dim')
-                        # Update table rows
-                        for fp, gain in rg_map.items():
-                            row(fp, {'rg': f'{gain} dB'})
-                    else:
-                        log(f'✗ rsgain error: {res.stderr[:100]}', 'err')
-                        status('ReplayGain failed', True)
+                # ReplayGain — whole folder at once
+                if opts.get('replaygain') and not self._stop:
+                    status('Applying ReplayGain…')
+                    log('Applying ReplayGain…', 'info')
+                    try:
+                        res = subprocess.run(
+                            [get_rsgain_path(), 'easy', music_root],
+                            capture_output=True, text=True
+                        )
+                        if res.returncode == 0:
+                            log('✓ ReplayGain done', 'ok')
+                            # Parse per-track gain from rsgain output
+                            # Strip ANSI escape codes first
+                            import re as _re
+                            clean_out = _re.sub(r'\x1b\[[0-9;]*m', '', res.stdout)
+                            current_file = None
+                            for line in clean_out.splitlines():
+                                line = line.strip()
+                                if line.startswith('Track:'):
+                                    current_file = line.replace('Track:', '').strip()
+                                elif line.startswith('Gain:') and current_file:
+                                    # "Gain:  -13.06 dB" → "-13.06"
+                                    parts = line.replace('Gain:', '').strip().split()
+                                    gain = parts[0] if parts else '?'
+                                    row(current_file, {'rg': f'{gain} dB'})
+                                    log(f'  RG {os.path.basename(current_file)}: {gain} dB', 'dim')
+                                    current_file = None  # reset to avoid duplicate
+                        else:
+                            err_msg = res.stderr.strip()
+                            log(interpret_error(err_msg, 'rsgain'), 'err')
+                            status('ReplayGain failed — see log for details', True)
+                    except FileNotFoundError:
+                        log('✗ rsgain not found — bundled binary missing', 'err')
+                        status('rsgain not found', True)
 
                 retry_files = []
 
                 for idx, filepath in enumerate(files):
                     if self._stop:
                         log('⛔ Stopped by user', 'err')
-                        status('Stopped')
+                        status('Stopped by user')
                         break
 
                     fname = os.path.basename(filepath)
                     title, artist = get_tags(filepath)
-                    pct = (idx + 1) / total
-                    self._js('onProgress', pct)
+                    self._js('onProgress', (idx + 1) / total)
                     row(filepath, {'status': 'running'})
-
                     updates = {'status': 'ok'}
                     had_error = False
 
@@ -1450,14 +1707,19 @@ class Api:
                     # DR
                     if opts.get('dr'):
                         status(f'Analyzing DR — {fname}')
-                        dr = calculate_dr14(filepath)
-                        if dr:
-                            write_dr_tag(filepath, dr)
-                            updates['dr'] = f'DR{dr["dr"]}'
-                            updates['rg'] = f'{dr["peak_db"]:.1f}dB'
-                            log(f'🎛 {fname}: DR{dr["dr"]}')
-                        else:
-                            updates['dr'] = '—'
+                        try:
+                            dr = calculate_dr14(filepath)
+                            if dr:
+                                write_dr_tag(filepath, dr)
+                                updates['dr'] = f'DR{dr["dr"]}'
+                                log(f'🎛 {fname}: DR{dr["dr"]}')
+                            else:
+                                updates['dr'] = '—'
+                        except Exception as e:
+                            msg = interpret_error(str(e))
+                            log(f'{msg} — {fname}', 'err')
+                            status(f'DR error: {fname}', True)
+                            had_error = True
 
                     # Lyrics + Genre
                     if opts.get('lyrics') and title and artist:
@@ -1473,17 +1735,18 @@ class Api:
                             try:
                                 song = genius_client.search_song(title, artist)
                                 if (not song or not song.lyrics) and has_parens:
-                                    log(f'🔍 {fname}: retrying without parentheses...', 'dim')
+                                    log(f'🔍 {fname}: retrying without parentheses…', 'dim')
                                     song = genius_client.search_song(title_clean, artist)
                             except Exception as e:
                                 err = str(e)
                                 if 'reset' in err.lower() or 'timed out' in err.lower():
                                     retry_files.append(filepath)
-                                    log(f'💥 {fname}: network error — will retry', 'err')
-                                    status(f'Network error: {fname}', True)
+                                    log(interpret_error(err, 'genius'), 'err')
+                                    log(f'  → Will retry: {fname}', 'dim')
+                                    status(f'Network error — will retry: {fname}', True)
                                 else:
-                                    log(f'💥 {fname}: {err[:60]}', 'err')
-                                    status(f'Genius error: {err[:40]}', True)
+                                    log(interpret_error(err, 'genius'), 'err')
+                                    status(interpret_error(err, 'genius')[:60], True)
                                     had_error = True
 
                             if song and song.lyrics:
@@ -1499,28 +1762,31 @@ class Api:
                                 already_genre = has_genre(filepath)
                                 if not already_genre or opts.get('overwrite'):
                                     status(f'Fetching genre — {artist}')
-                                    genre = get_genre_lastfm(artist, title, lastfm_key)
-                                    if not genre and song:
-                                        try:
-                                            tag = song.to_dict().get('primary_tag', {})
-                                            genre = (tag.get('name','') or '').title() or None
-                                        except Exception:
-                                            pass
-                                    if genre:
-                                        write_genre(filepath, genre)
-                                        log(f'🎸 {fname}: genre → {genre}', 'ok')
-                                        updates['genre'] = genre
-                                    else:
-                                        status(f'Genre not found: {artist}', True)
+                                    try:
+                                        genre = get_genre_lastfm(artist, title, lastfm_key)
+                                        if not genre and song:
+                                            try:
+                                                tag = song.to_dict().get('primary_tag', {})
+                                                genre = (tag.get('name', '') or '').title() or None
+                                            except Exception: pass
+                                        if genre:
+                                            write_genre(filepath, genre)
+                                            log(f'🎸 {fname}: genre → {genre}', 'ok')
+                                            updates['genre'] = genre
+                                        else:
+                                            status(f'Genre not found: {artist}', True)
+                                    except Exception as e:
+                                        msg = interpret_error(str(e), 'lastfm')
+                                        log(msg, 'err')
+                                        status(msg[:60], True)
 
-                    if had_error:
-                        updates['status'] = 'err'
+                    if had_error: updates['status'] = 'err'
                     row(filepath, updates)
 
                 # Retry
                 if retry_files and not self._stop:
-                    log(f'\n🔁 Retrying {len(retry_files)} files...', 'info')
-                    status('Retrying failed files...')
+                    log(f'\n🔁 Retrying {len(retry_files)} files…', 'info')
+                    status('Retrying failed files…')
                     time.sleep(3)
                     for filepath in retry_files:
                         if self._stop: break
@@ -1533,15 +1799,18 @@ class Api:
                                     write_lyrics(filepath, clean_lyrics(song.lyrics))
                                     log(f'✓ {fname}: lyrics added on retry', 'ok')
                                     row(filepath, {'lyrics': 'Yes', 'status': 'ok'})
+                                else:
+                                    row(filepath, {'status': 'err'})
                             except Exception:
                                 log(f'✗ {fname}: retry failed', 'err')
                                 row(filepath, {'status': 'err'})
 
-                log('\n✅ Done!', 'ok')
+                log('\n✅ All done!', 'ok')
                 status('Done')
             except Exception as e:
-                self._js('onLog', f'❌ Fatal error: {e}', 'err')
-                self._js('onStatus', f'Fatal error: {e}', True)
+                msg = interpret_error(str(e))
+                self._js('onLog', msg, 'err')
+                self._js('onStatus', msg[:80], True)
             finally:
                 self._js('onTaggerDone')
 
@@ -1552,7 +1821,7 @@ class Api:
             try:
                 files = [f for f in scan_audio_files(path) if f.lower().endswith('.flac')]
                 total = len(files)
-                if total == 0:
+                if not total:
                     self._js('onCheckerDone', 'No FLAC files found')
                     return
 
@@ -1587,17 +1856,102 @@ class Api:
                         parts.append(f'<b>{label}:</b> {counts[k]}')
                 summary = f'Total: <b>{total}</b> &nbsp;|&nbsp; ' + ' &nbsp;|&nbsp; '.join(parts)
                 self._js('onCheckerDone', summary)
-
             except Exception as e:
                 self._js('onCheckerDone', f'Error: {e}')
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def check_updates(self) -> dict:
+        """Check GitHub for latest AudioTagger release."""
+        import urllib.request, json, ssl
+        ssl_ctx = ssl.create_default_context()
+        try:
+            import certifi
+            ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+
+        try:
+            url = 'https://api.github.com/repos/Nik-Grish/Audio-Tagger/releases/latest'
+            req = urllib.request.Request(url, headers={'User-Agent': f'AudioTagger/{APP_VERSION}'})
+            with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as r:
+                data = json.loads(r.read())
+
+            tag = data.get('tag_name', 'unknown')
+            body = data.get('body', '')
+            # Find DMG asset download URL
+            dmg_url = None
+            for asset in data.get('assets', []):
+                if asset['name'].endswith('.dmg'):
+                    dmg_url = asset['browser_download_url']
+                    break
+
+            return {
+                'latest_version': tag,
+                'release_url': data.get('html_url', 'https://github.com/Nik-Grish/Audio-Tagger/releases'),
+                'dmg_url': dmg_url,
+                'release_notes': body[:300] if body else '',
+            }
+        except Exception as e:
+            return {'error': str(e)[:100]}
+
+    def open_url(self, url: str):
+        """Open URL in default browser."""
+        subprocess.run(['open', url])
 
     def open_log(self):
         if self._log_path and os.path.exists(self._log_path):
             subprocess.run(['open', self._log_path])
         else:
             self._js('onLog', 'No log file yet — run a scan first', 'err')
+
+    def install_flad(self):
+        """Clone FLAD repo and download model."""
+        import ssl
+        import urllib.request
+        flad_dir = os.path.join(os.path.expanduser('~'), 'FLAD')
+        model_dir = os.path.join(flad_dir, 'models')
+        model_path = os.path.join(model_dir, 'flad.onnx')
+
+        # SSL context that works with Python.org builds which lack system certs
+        ssl_ctx = ssl.create_default_context()
+        try:
+            import certifi
+            ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+
+        def download(url, dest):
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=ssl_ctx)
+            )
+            with opener.open(url) as r, open(dest, 'wb') as f:
+                f.write(r.read())
+
+        try:
+            if not os.path.exists(flad_dir):
+                res = subprocess.run(
+                    ['git', 'clone', 'https://github.com/Sg4Dylan/FLAD.git', flad_dir],
+                    capture_output=True, text=True
+                )
+                if res.returncode != 0:
+                    return {'ok': False, 'message': f'git clone failed: {res.stderr[:100]}', 'path': ''}
+            else:
+                subprocess.run(['git', '-C', flad_dir, 'pull'], capture_output=True)
+
+            os.makedirs(model_dir, exist_ok=True)
+            if not os.path.exists(model_path):
+                model_url = 'https://github.com/Sg4Dylan/FLAD/releases/download/v0.1/flad.onnx'
+                download(model_url, model_path)
+
+            cfg = load_config()
+            cfg['FLAD_DIR'] = flad_dir
+            save_config(cfg)
+            return {'ok': True, 'message': f'FLAD installed to {flad_dir}', 'path': flad_dir}
+        except Exception as e:
+            return {'ok': False, 'message': f'Error: {str(e)[:120]}', 'path': ''}
 
 
 # ============================================================
@@ -1616,16 +1970,14 @@ if __name__ == '__main__':
         background_color='#060614',
     )
     api = Api(window)
-    window.expose(api.get_config)
-    window.expose(api.browse_folder)
-    window.expose(api.close_app)
-    window.expose(api.minimize_app)
-    window.expose(api.toggle_maximize)
-    window.expose(api.save_settings)
-    window.expose(api.stop_tagger)
-    window.expose(api.get_file_list)
-    window.expose(api.run_tagger)
-    window.expose(api.run_checker)
-    window.expose(api.open_log)
-
+    for method in [
+        api.get_config, api.browse_folder, api.close_app,
+        api.minimize_app, api.toggle_maximize,
+        api.save_settings, api.save_music_root,
+        api.open_config, api.open_log,
+        api.stop_tagger, api.check_flad,
+        api.reveal_in_finder, api.get_file_list,
+        api.run_tagger, api.run_checker, api.install_flad, api.check_updates, api.open_url,
+    ]:
+        window.expose(method)
     webview.start(debug=False)
